@@ -14,7 +14,7 @@ the part is:
 
 
 
-  #1) debit the sender (only if the balance is enough)
+    #1) debit the sender (only if the balance is enough)
     debit = session.execute(
         update(Account)
         .where(Account.id == from_id, Account.balance_piastres >= amount)
