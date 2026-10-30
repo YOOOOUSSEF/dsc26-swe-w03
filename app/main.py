@@ -2,6 +2,8 @@
 import math
 import uuid
 
+import threading
+bucket_lock = threading.Lock()
 from fastapi import FastAPI,Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -20,10 +22,9 @@ class CustomException(Exception):
 def problem(title,status,headers=None,errors=None, detail=None):
       body = {"type": "about:blank", "title": title, "status": status}
 
-      if errors is None:
-        body['errors']=errors
-      if detail is None:
-        body['detail']=detail
+
+      if errors is not None: body['errors'] = errors
+      if detail is not None: body['detail'] = detail
 
       return JSONResponse(content=body,status_code=status,headers=headers,media_type="application/problem+json")
 
@@ -116,31 +117,35 @@ def create_app(settings: Settings) -> FastAPI:
 
         # Rate Limiting
         if request.url.path=="/v1/transfers" and request.method == "POST":
-          # 1) Rate limiting (Filling) 
-          now=settings.clock()
-          elapsed =max(0, now- bucket[auth_customer_id]["last_refill"]) # if clock goes backword, then = 0.
+          with bucket_lock:
+            # 1) Rate limiting (Filling) 
+            now=settings.clock()
+            elapsed =max(0, now- bucket[auth_customer_id]["last_refill"]) # if clock goes backword, then = 0.
 
-          bucket[auth_customer_id]['tokens']=min(
-            settings.rate_limit_capacity,
-            bucket[auth_customer_id]['tokens']+elapsed*settings.rate_limit_refill_per_second
-          )# put fractional tokens (because algorithm says that) and also good accuracy.
-          
-          bucket[auth_customer_id]["last_refill"]=now
+            bucket[auth_customer_id]['tokens']=min(
+                settings.rate_limit_capacity,
+                bucket[auth_customer_id]['tokens']+elapsed*settings.rate_limit_refill_per_second
+            )# put fractional tokens (because algorithm says that) and also good accuracy.
+            
+            bucket[auth_customer_id]["last_refill"]=now
 
-          # 2) Rate limiting (checking) ( I do not make it in middleware Because it is not on all endpoints)
-          cus_tokens=bucket[auth_customer_id]['tokens']
-          if cus_tokens < 1: # if user finishes his tokens.
-            # time until 1 token completed.
-            # settings.rate_limit_refill_per_second must be non zero.
-            wait = math.ceil((1 - cus_tokens) / settings.rate_limit_refill_per_second) 
-            header={'Retry-After':str(wait)} # The header value must be str in framework like FastApi.
-            return JSONResponse(
-            status_code=429,
-            content={"type": "about:blank", "title": "You hitted the requests limit", "status": 429},
-            media_type="application/problem+json",headers=header
-            )
-          else: # decrease token by 1
-            bucket[auth_customer_id]['tokens']-=1
+            # 2) Rate limiting (checking) ( I do not make it in middleware Because it is not on all endpoints)
+            cus_tokens=bucket[auth_customer_id]['tokens']
+            if cus_tokens < 1: # if user finishes his tokens.
+                # time until 1 token completed.
+                # settings.rate_limit_refill_per_second must be non zero.
+                wait = math.ceil((1 - cus_tokens) / settings.rate_limit_refill_per_second) 
+                header={'Retry-After':str(wait)} # The header value must be str in framework like FastApi.
+                return JSONResponse(
+                status_code=429,
+                content={"type": "about:blank", "title": "You hitted the requests limit", "status": 429},
+                media_type="application/problem+json",headers=header
+                )
+            else: # decrease token by 1
+                bucket[auth_customer_id]['tokens']-=1
+
+
+        
 
         response=await call_next(request) # to complete life cycle of request.
         return response   
@@ -179,7 +184,9 @@ def create_app(settings: Settings) -> FastAPI:
             else: # replay the response
                return JSONResponse(content=Idempotency_record.response_body,
                 status_code=Idempotency_record.status_code,
-                headers={'Idempotent-Replayed':'true'})
+                headers={'Idempotent-Replayed':'true'},
+                media_type="application/problem+json" if Idempotency_record.status_code//100 ==4 else "application/json"
+                )
         else:
         # 0) check if the authenticated one is the sender.
             sender = session.get(Account, body.from_account_id)
@@ -205,11 +212,12 @@ def create_app(settings: Settings) -> FastAPI:
                 amount_piastres=body.amount_piastres,
                 memo=body.memo,
                 status_code=409,
-                response_body={'title':"Insufficient funds","status":409}
+                response_body={"type": "about:blank",'title':"Insufficient funds","status":409}
                 )
                 session.add(Idempotency_record)
-                session.commit() # add record to db before raising error & rolling back.
-                raise CustomException(title="Insufficient funds", status=409)
+                return JSONResponse(content={"type":"about:blank",
+                                    "title":"Insufficient funds","status":409},
+                                    status_code=409, media_type="application/problem+json")
 
             # 2) credit the receiver
             credit = session.execute(
@@ -286,18 +294,23 @@ def create_app(settings: Settings) -> FastAPI:
         local_session=make_session_factory(app.state.engine)
         with local_session() as session, session.begin():
             transfer=session.get(Transfer, transfer_id)
+            if transfer is None :
+                raise CustomException(title='source or destination account not owned by caller (or not existing)',status=404)
+            # get accounts to compare ids.
+            s = session.get(Account, transfer.from_account_id)
+            r = session.get(Account, transfer.to_account_id)
 
-            if transfer is None or (transfer.from_account_id!=customer_id and transfer.to_account_id!=customer_id):
+            if (s.owner_id!=customer_id and r.owner_id!=customer_id):
                 raise CustomException(title='source or destination account not owned by caller (or not existing)',status=404)
 
-        result = {
-            "id": transfer.id,
-            "from_account_id": transfer.from_account_id,
-            "to_account_id": transfer.to_account_id,
-            "amount_piastres": transfer.amount_piastres,
-            "memo": transfer.memo,
-            "status": transfer.status
-            }  
+            result = {
+                "id": transfer.id,
+                "from_account_id": transfer.from_account_id,
+                "to_account_id": transfer.to_account_id,
+                "amount_piastres": transfer.amount_piastres,
+                "memo": transfer.memo,
+                "status": transfer.status
+                }  
         return result
     
     return app
