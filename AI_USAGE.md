@@ -10,6 +10,10 @@ is not scored, but your Track Mentor reads it and the W8 defence can ask about i
 tools -> claude
 some explanations and one part it writes.
 the part is:
+
+
+
+
   #1) debit the sender (only if the balance is enough)
     debit = session.execute(
         update(Account)
